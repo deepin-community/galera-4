@@ -66,7 +66,11 @@ from_string(const std::string& s,
 
     try
     {
-        if ((iss >> f >> ret).fail()) throw NotFound();
+        iss >> f >> ret;
+        if (iss.fail() || not iss.eof())
+        {
+            throw NotFound();
+        }
     }
     catch (gu::Exception& e)
     {
@@ -93,7 +97,11 @@ from_string<void*>(const std::string& s,
     std::istringstream iss(s);
     void*              ret;
 
-    if ((iss >> std::hex >> ret).fail()) throw NotFound();
+    iss >> std::hex >> ret;
+    if (iss.fail() || not iss.eof())
+    {
+        throw NotFound();
+    }
 
     return ret;
 }
@@ -156,14 +164,6 @@ class DeleteObject
 public:
     template <class T> void operator()(T* t) { delete t; }
 };
-
-/*! swap method for arrays, which does't seem to be built in all compilers */
-template <typename T, size_t N>
-inline void
-swap_array(T (&a)[N], T (&b)[N])
-{
-    for (size_t n(0); n < N; ++n) std::swap(a[n], b[n]);
-}
 
 typedef std::ios_base& (*base_t) (std::ios_base& str);
 

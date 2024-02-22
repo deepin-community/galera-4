@@ -1,0 +1,28 @@
+From: https://salsa.debian.org/mariadb-team/galera-4/-/merge_requests/13
+Forwarded: https://github.com/codership/galera/pull/588
+Date: Fri, 15 Sep 2023 12:30:58 +1000
+Author: Daniel Black <daniel@mariadb.org>
+Subject: Reduce galera.cache size test for Salsa
+--- a/galera/tests/defaults_check.cpp
++++ b/galera/tests/defaults_check.cpp
+@@ -60,9 +60,9 @@ static const char* Defaults[] =
+     "gcache.keep_pages_size",      "0",
+     "gcache.mem_size",             "0",
+     "gcache.name",                 "galera.cache",
+-    "gcache.page_size",            "128M",
++    "gcache.page_size",            "8M",
+     "gcache.recover",              "yes",
+-    "gcache.size",                 "128M",
++    "gcache.size",                 "8M",
+     "gcomm.thread_prio",           "",
+     "gcs.fc_debug",                "0",
+     "gcs.fc_factor",               "1.0",
+@@ -250,7 +250,7 @@ START_TEST(defaults)
+             NULL, // const char* node_address
+             NULL, // const char* node_incoming
+             NULL, // const char* data_dir
+-            NULL, // const char* options
++            "gcache.page_size=8M;gcache.size=8M", // const char* options
+             0,    // int         proto_ver
+
+             /* Application initial state information. */

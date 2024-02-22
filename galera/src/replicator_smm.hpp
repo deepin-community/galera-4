@@ -1,5 +1,5 @@
 //
-// Copyright (C) 2010-2020 Codership Oy <info@codership.com>
+// Copyright (C) 2010-2021 Codership Oy <info@codership.com>
 //
 
 //! @file replicator_smm.hpp
@@ -11,6 +11,7 @@
 #define GALERA_REPLICATOR_SMM_HPP
 
 #include "replicator.hpp"
+#include "progress_callback.hpp"
 
 #include "gu_init.h"
 #include "GCache.hpp"
@@ -410,6 +411,7 @@ namespace galera
         {
             if (gu_unlikely(purge_seqno != -1))
             {
+                assert(purge_seqno <= last_committed());
                 service_thd_.report_last_committed(purge_seqno);
             }
         }
@@ -464,8 +466,6 @@ namespace galera
                                          const TrxHandleSlavePtr&);
         wsrep_status_t cert_and_catch   (TrxHandleMaster*,
                                          const TrxHandleSlavePtr&);
-        wsrep_status_t cert_for_aborted (const TrxHandleSlavePtr&);
-
         // Enter apply monitor for local transaction. Return true
         // if apply monitor was grabbed.
         bool enter_apply_monitor_for_local(TrxHandleMaster&,
@@ -538,6 +538,12 @@ namespace galera
                         GU_DBUG_SYNC_WAIT("local_monitor_slave_enter_sync");
                         mutex.lock();
                     }
+                }
+                else
+                {
+                    mutex.unlock();
+                    GU_DBUG_SYNC_WAIT("local_monitor_enter_sync");
+                    mutex.lock();
                 }
             }
 #endif //GU_DBUG_ON
@@ -983,13 +989,16 @@ namespace galera
         bool          sst_received_;
 
         // services
-        gcache::GCache gcache_;
-        GCS_IMPL       gcs_;
-        ServiceThd     service_thd_;
+        ProgressCallback<int64_t> gcache_progress_cb_;
+        gcache::GCache   gcache_;
+        ProgressCallback<gcs_seqno_t> joined_progress_cb_;
+        GCS_IMPL         gcs_;
+        ServiceThd       service_thd_;
 
         // action sources
         TrxHandleSlave::Pool slave_pool_;
         ActionSource*        as_;
+        ProgressCallback<wsrep_seqno_t>ist_progress_cb_;
         ist::Receiver        ist_receiver_;
         ist::AsyncSenderMap  ist_senders_;
 
