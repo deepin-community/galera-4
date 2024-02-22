@@ -1,0 +1,1965 @@
+From: https://github.com/codership/galera/commits/4.x-26.4.16-gh-558
+Forwarded: https://github.com/codership/galera/pull/588
+From cb4437f7f4b30ff1d3394fa10fa1e4168b47b61c Mon Sep 17 00:00:00 2001
+Author: Teemu Ollakka <teemu.ollakka@galeracluster.com>
+Date: Mon, 2 Oct 2023 14:48:06 +0300
+Subject: [PATCH 1/8] Add CMake option to compile with UBSAN instrumentation
+
+CMake option -DGALERA_WITH_UBSAN:BOOL=ON enables UBSAN
+instrumentation for the build.
+---
+ cmake/asan.cmake | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+--- a/cmake/asan.cmake
++++ b/cmake/asan.cmake
+@@ -1,5 +1,5 @@
+ #
+-# Copyright (C) 2020 Codership Oy <info@codership.com>
++# Copyright (C) 2020-2023 Codership Oy <info@codership.com>
+ #
+ 
+ if (GALERA_WITH_ASAN)
+@@ -7,3 +7,21 @@ if (GALERA_WITH_ASAN)
+   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address")
+   add_definitions(-DGALERA_WITH_ASAN)
+ endif()
++
++if (GALERA_WITH_UBSAN)
++  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=undefined")
++  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined")
++  add_definitions(-DGALERA_WITH_UBSAN)
++  # don't run unit tests that use outdaed unaligned record set format
++  add_definitions(-DGALERA_ONLY_ALIGNED)
++
++  find_library(UBSAN_LIB NAMES ubsan libubsan.so.1)
++  message(STATUS ${UBSAN_LIB})
++  set(CMAKE_REQUIRED_LIBRARIES ${UBSAN_LIB})
++  check_c_source_compiles("int main() { return 0; }" GALERA_HAVE_UBSAN_LIB)
++  if (NOT GALERA_HAVE_UBSAN_LIB)
++    message(FATAL_ERROR "Could not find UBSAN support library")
++  endif()
++  unset(CMAKE_REQUIRED_LIBRARIES)
++  list(APPEND GALERA_SYSTEM_LIBS ${UBSAN_LIB})
++endif()
+--- a/cmake/os.cmake
++++ b/cmake/os.cmake
+@@ -11,7 +11,8 @@ set(GALERA_SYSTEM_LIBS ${PTHREAD_LIB} ${
+ if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+   # Check if linkage with atomic library is needed for 8 byte atomics
+   set(ATOMIC_8_TEST_C_SOURCE
+-     "int main() { long long val; __atomic_fetch_add_8(&val, 1, __ATOMIC_SEQ_CST); return 0;}")
++     "#include <stdatomic.h>
++      int main() { atomic_llong val; atomic_fetch_add(&val, 1); return 0; }")
+   check_c_source_compiles("${ATOMIC_8_TEST_C_SOURCE}" GALERA_HAVE_ATOMIC)
+   if (NOT GALERA_HAVE_ATOMIC)
+     find_library(ATOMIC_LIB NAMES atomic libatomic.so.1)
+--- a/cmake/compiler.cmake
++++ b/cmake/compiler.cmake
+@@ -1,5 +1,5 @@
+ #
+-# Copyright (C) 2020 Codership Oy <info@codership.com>
++# Copyright (C) 2020-2023 Codership Oy <info@codership.com>
+ #
+ # Common compiler and preprocessor options.
+ #
+@@ -46,7 +46,8 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}
+ 
+ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+   # To detect STD library misuse with Debug builds.
+-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_ASSERTIONS")
++  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_ASSERTIONS -O0")
++  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O0")
+   # Enable debug sync points
+   add_definitions(-DGU_DBUG_ON)
+ else()
+--- a/galera/tests/data_set_check.cpp
++++ b/galera/tests/data_set_check.cpp
+@@ -1,10 +1,14 @@
+-/* Copyright (C) 2013-2020 Codership Oy <info@codership.com>
++/* Copyright (C) 2013-2023 Codership Oy <info@codership.com>
+  *
+  * $Id$
+  */
+ 
+ #undef NDEBUG
+ 
++#if defined(__sun)
++#define GALERA_ONLY_ALIGNED
++#endif
++
+ #include "../src/data_set.hpp"
+ 
+ #include "gu_logger.hpp"
+--- a/galera/tests/defaults_check.cpp
++++ b/galera/tests/defaults_check.cpp
+@@ -1,5 +1,5 @@
+ //
+-// Copyright (C) 2018-2020 Codership Oy <info@codership.com>
++// Copyright (C) 2018-2023 Codership Oy <info@codership.com>
+ //
+ 
+ #include <wsrep_api.h>
+@@ -307,7 +307,6 @@ START_TEST(defaults)
+                       ret, strerror(ret));
+     }
+ 
+-    provider.free(&provider);
+     mark_point();
+ 
+     /* cleanup files */
+--- a/galerautils/src/gu_crc32c_x86.c
++++ b/galerautils/src/gu_crc32c_x86.c
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2020 Codership Oy <info@codership.com>
++ * Copyright (C) 2020-2023 Codership Oy <info@codership.com>
+  */
+ 
+ /**
+@@ -19,33 +19,77 @@
+ #include <assert.h>
+ #include <stdbool.h>
+ 
++/* process data preceding the first 4-aligned byte */
+ static inline gu_crc32c_t
+-crc32c_x86_tail3(gu_crc32c_t state, const uint8_t* ptr, size_t len)
++crc32c_x86_head3(gu_crc32c_t state, const uint8_t* ptr, size_t len)
+ {
++    assert(len > 0);
+     assert(len < 4);
+ 
+-    switch (len)
++    if (((uintptr_t)ptr) & 1)
+     {
+-    case 3:
++        /* odd address */
+         state = __builtin_ia32_crc32qi(state, *ptr);
+         ptr++;
+-        /* fall through */
++        len--;
++    }
++
++    /* here ptr is at least 2-aligned */
++    if (len >= 2)
++    {
++        assert(0 == ((uintptr_t)ptr)%2);
++        state = __builtin_ia32_crc32hi(state, *(uint16_t*)ptr);
++        ptr += 2;
++        len -= 2;
++    }
++
++    if (len)
++    {
++        assert(1 == len);
++        state = __builtin_ia32_crc32qi(state, *ptr);
++    }
++
++    return state;
++}
++
++static inline gu_crc32c_t
++crc32c_x86_tail3(gu_crc32c_t state, const uint8_t* ptr, size_t len)
++{
++    switch (len)
++    {
++    case 3:
+     case 2:
++        /* this byte is 4-aligned */
+         state = __builtin_ia32_crc32hi(state, *(uint16_t*)ptr);
+-        break;
++        if (len == 2) break;
++        ptr += 2;
++        /* fall through */
+     case 1:
+         state = __builtin_ia32_crc32qi(state, *ptr);
++        break;
++    default:
++        assert(0);
+     }
+-
+     return state;
+ }
+ 
+ static inline gu_crc32c_t
+ crc32c_x86(gu_crc32c_t state, const uint8_t* ptr, size_t len)
+ {
++    if (0 == len) return state;
++
+     static size_t const arg_size = sizeof(uint32_t);
+ 
+-    /* apparently no ptr misalignment protection is needed */
++    size_t align_offset = ((uintptr_t)ptr) % arg_size;
++    if (align_offset)
++    {
++        align_offset = arg_size - align_offset;
++        if (align_offset > len) align_offset = len;
++        state = crc32c_x86_head3(state, ptr, align_offset);
++        len -= align_offset;
++        ptr += align_offset;
++    }
++
+     while (len >= arg_size)
+     {
+         state = __builtin_ia32_crc32si(state, *(uint32_t*)ptr);
+@@ -55,7 +99,7 @@ crc32c_x86(gu_crc32c_t state, const uint
+ 
+     assert(len < 4);
+ 
+-    return crc32c_x86_tail3(state, ptr, len);
++    return (len ? crc32c_x86_tail3(state, ptr, len) : state);
+ }
+ 
+ gu_crc32c_t
+@@ -71,7 +115,20 @@ gu_crc32c_x86_64(gu_crc32c_t state, cons
+     const uint8_t* ptr = (const uint8_t*)data;
+ 
+ #ifdef __LP64__
++    if (0 == len) return state;
++
+     static size_t const arg_size = sizeof(uint64_t);
++
++    size_t align_offset = ((uintptr_t)ptr) % arg_size;
++    if (align_offset)
++    {
++        align_offset = arg_size - align_offset;
++        if (align_offset > len) align_offset = len;
++        state = crc32c_x86(state, ptr, align_offset);
++        len -= align_offset;
++        ptr += align_offset;
++    }
++
+     uint64_t state64 = state;
+ 
+     while (len >= arg_size)
+--- a/galerautils/src/gu_mmh3.c
++++ b/galerautils/src/gu_mmh3.c
+@@ -257,10 +257,11 @@ static uint64_t const GU_MMH128_SEED2 =
+ extern void
+ gu_mmh128 (const void* const msg, size_t const len, void* const out)
+ {
+-    _mmh3_128_seed (msg, len, GU_MMH128_SEED1, GU_MMH128_SEED2, (uint64_t*)out);
+-    uint64_t* const res = (uint64_t*)out;
++    uint64_t res[2];
++    _mmh3_128_seed (msg, len, GU_MMH128_SEED1, GU_MMH128_SEED2, res);
+     res[0] = gu_le64(res[0]);
+     res[1] = gu_le64(res[1]);
++    memcpy(out, res, sizeof(res));
+ }
+ 
+ /* returns hash as an integer, in host byte-order */
+@@ -378,8 +379,9 @@ gu_mmh128_get32 (const gu_mmh128_ctx_t*
+ void
+ gu_mmh3_32 (const void* const key, int const len, uint32_t const seed, void* const out)
+ {
+-    uint32_t const res = _mmh32_seed (key, len, seed);
+-    *((uint32_t*)out)  = gu_le32(res);
++    uint32_t res = _mmh32_seed (key, len, seed);
++    res = gu_le32(res);
++    memcpy(out, &res, sizeof(res));
+ }
+ 
+ //-----------------------------------------------------------------------------
+--- a/galerautils/src/gu_utils.c
++++ b/galerautils/src/gu_utils.c
+@@ -1,4 +1,4 @@
+-// Copyright (C) 2010 Codership Oy <info@codership.com>
++// Copyright (C) 2010-2023 Codership Oy <info@codership.com>
+ 
+ /**
+  * @file Miscellaneous utility functions
+@@ -42,13 +42,20 @@ gu_str2ll (const char* str, long long* l
+         shift += 10;
+         ret++;
+ 
+-        if (llret == ((llret << (shift + 1)) >> (shift + 1))) {
+-            llret <<= shift;
+-        }
+-        else { /* ERANGE */
+-            if (llret > 0) llret = LLONG_MAX;
+-            else llret = LLONG_MIN;
+-            errno = ERANGE;
++        {
++            long long const sign = (llret < 0 ? -1 : 1);
++            unsigned long long ullret = sign * llret;
++
++            if (ullret == ((ullret << (shift + 1)) >> (shift + 1))) {
++                ullret <<= shift;
++                llret = ullret;
++                llret *= sign;
++            }
++            else { /* ERANGE */
++                if (llret > 0) llret = LLONG_MAX;
++                else llret = LLONG_MIN;
++                errno = ERANGE;
++            }
+         }
+         /* fall through */
+     default:
+--- a/galera/src/certification.cpp
++++ b/galera/src/certification.cpp
+@@ -98,8 +98,8 @@ check_purge_complete(const galera::Certi
+ {
+     std::for_each(
+         cert_index.begin(), cert_index.end(),
+-        [&cert_index, &key_set,
+-         ts](const galera::Certification::CertIndexNG::value_type& ke) {
++        [&key_set, ts]
++        (const galera::Certification::CertIndexNG::value_type& ke) {
+             ke->for_each_ref([&ke, &key_set, ts](const TrxHandleSlave* ref) {
+                 if (ts == ref)
+                 {
+--- a/gcache/src/gcache_mem_store.hpp
++++ b/gcache/src/gcache_mem_store.hpp
+@@ -92,16 +92,19 @@ namespace gcache
+ 
+         void* realloc (void* ptr, size_type size)
+         {
+-            BufferHeader* bh(0);
+-            size_type old_size(0);
++            if (!ptr) return malloc(size);
+ 
+-            if (ptr)
++            BufferHeader* bh(ptr2BH(ptr));
++            assert (SEQNO_NONE == bh->seqno_g);
++
++            if (!size)
+             {
+-                bh = ptr2BH(ptr);
+-                assert (SEQNO_NONE == bh->seqno_g);
+-                old_size = bh->size;
++                free(bh);
++                return nullptr;
+             }
+ 
++            uintptr_t const orig(reinterpret_cast<uintptr_t>(bh));
++            size_type const old_size(bh->size);
+             diff_type const diff_size(size - old_size);
+ 
+             if (size > max_size_ ||
+@@ -109,11 +112,11 @@ namespace gcache
+ 
+             assert (size_ + diff_size <= max_size_);
+ 
++            allocd_.erase(bh);
+             void* tmp = ::realloc (bh, size);
+ 
+             if (tmp)
+             {
+-                allocd_.erase(bh);
+                 allocd_.insert(tmp);
+ 
+                 bh = BH_cast(tmp);
+@@ -124,6 +127,13 @@ namespace gcache
+ 
+                 return (bh + 1);
+             }
++            else
++            {
++                assert(size > 0);
++                /* orginal buffer is still allocated so we need to restore it
++                 * but we can't use bh directly due to GCC warnings */
++                allocd_.insert(reinterpret_cast<BufferHeader*>(orig));
++            }
+ 
+             return 0;
+         }
+@@ -133,8 +143,8 @@ namespace gcache
+             assert (BH_is_released(bh));
+ 
+             size_ -= bh->size;
+-            ::free (bh);
+             allocd_.erase(bh);
++            ::free (bh);
+         }
+ 
+         void set_max_size (size_t size) { max_size_ = size; }
+--- a/gcache/src/gcache_rb_store.cpp
++++ b/gcache/src/gcache_rb_store.cpp
+@@ -798,7 +798,8 @@ namespace gcache
+                                                        sizeof(cs_old)));
+                         std::ostringstream msg;
+ 
+-                        msg << "Attempt to reuse the same seqno: " << seqno_g
++                        msg << "Attempt (" << collision_count
++                            << ") to reuse the same seqno: " << seqno_g
+                             << ". New ptr = " << new_ptr << ", " << bh
+                             << ", cs: " << gu::Hexdump(cs_new, sizeof(cs_new))
+                             << ", previous ptr = " << old_ptr;
+@@ -1230,7 +1231,7 @@ namespace gcache
+         size_t chain_count[] = { 0, 0, 0, 0 };
+ 
+         chain_t chain(NONE);
+-        const uint8_t* chain_start;
++        const uint8_t* chain_start(start_);
+         size_t count;
+ 
+         bool next(false);
+--- a/gcs/src/gcs_group.cpp
++++ b/gcs/src/gcs_group.cpp
+@@ -1409,7 +1409,7 @@ group_for_each_donor_in_string (const gc
+          * that at least one of the nodes in the list will become available. */
+         if (-EAGAIN != err) err = idx;
+ 
+-        begin = end + 1; /* skip comma */
++        if (end) begin = end + 1; /* skip comma */
+ 
+     } while (end != NULL);
+ 
+@@ -1498,7 +1498,7 @@ group_find_ist_donor_by_name_in_string (
+                 ret = idx;
+             }
+         }
+-        begin = end + 1;
++        if (end) begin = end + 1;
+     } while (end != NULL);
+ 
+     if (ret == -1) {
+--- a/gcs/src/unit_tests/gcs_core_test.cpp
++++ b/gcs/src/unit_tests/gcs_core_test.cpp
+@@ -506,7 +506,7 @@ START_TEST (gcs_core_test_api)
+     size_t      act_size = sizeof(act3_str);
+ 
+     action_t act_s(act, NULL, NULL, act_size, GCS_ACT_WRITESET, -1, (gu_thread_t)-1);
+-    action_t act_r(act, NULL, NULL, -1, (gcs_act_type_t)-1, -1, (gu_thread_t)-1);
++    action_t act_r(act, NULL, NULL, -1, (gcs_act_type_t)GCS_ACT_UNKNOWN, -1, (gu_thread_t)-1);
+     long i = 5;
+ 
+     // test basic fragmentaiton
+@@ -610,7 +610,7 @@ CORE_TEST_OWN (int gcs_proto_ver)
+     size_t               act_size = sizeof(act2_str);
+ 
+     action_t act_s(act, NULL, NULL, act_size, GCS_ACT_WRITESET, -1, (gu_thread_t)-1);
+-    action_t act_r(act, NULL, NULL, -1, (gcs_act_type_t)-1, -1, (gu_thread_t)-1);
++    action_t act_r(act, NULL, NULL, -1, (gcs_act_type_t)GCS_ACT_UNKNOWN, -1, (gu_thread_t)-1);
+ 
+     // Create primary and non-primary component messages
+     gcs_comp_msg_t* prim     = gcs_comp_msg_new (true, false,  0, 1, 0);
+--- a/gcomm/src/evs_message2.cpp
++++ b/gcomm/src/evs_message2.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2009-2012 Codership Oy <info@codership.com>
++ * Copyright (C) 2009-2023 Codership Oy <info@codership.com>
+  *
+  * $Id$
+  */
+@@ -179,8 +179,16 @@ size_t gcomm::evs::Message::serialize(gu
+     return offset;
+ }
+ 
++gcomm::evs::Message::Type gcomm::evs::Message::get_type(const gu::byte_t* buf,
++                                                        size_t buflen,
++                                                        size_t offset)
++{
++    uint8_t b;
++    gu_trace(offset = gu::unserialize1(buf, buflen, offset, b));
++    return static_cast<Type>((b >> 2) & 0x7);
++}
+ 
+-size_t gcomm::evs::Message::unserialize(const gu::byte_t* const buf,
++size_t gcomm::evs::Message::unserialize_common(const gu::byte_t* const buf,
+                                         size_t            const buflen,
+                                         size_t                  offset)
+ {
+@@ -267,13 +275,9 @@ size_t gcomm::evs::UserMessage::serializ
+ 
+ size_t gcomm::evs::UserMessage::unserialize(const gu::byte_t* const buf,
+                                             size_t            const buflen,
+-                                            size_t                  offset,
+-                                            bool                    skip_header)
++                                            size_t                  offset)
+ {
+-    if (skip_header == false)
+-    {
+-        gu_trace(offset = Message::unserialize(buf, buflen, offset));
+-    }
++    gu_trace(offset = Message::unserialize_common(buf, buflen, offset));
+     gu_trace(offset = gu::unserialize1(buf, buflen, offset, user_type_));
+     uint8_t b;
+     gu_trace(offset = gu::unserialize1(buf, buflen, offset, b));
+@@ -340,13 +344,9 @@ size_t gcomm::evs::DelegateMessage::seri
+ 
+ size_t gcomm::evs::DelegateMessage::unserialize(const gu::byte_t* const buf,
+                                                 size_t            const buflen,
+-                                                size_t                  offset,
+-                                                bool                    skip_header)
++                                                size_t                  offset)
+ {
+-    if (skip_header == false)
+-    {
+-        gu_trace(offset = Message::unserialize(buf, buflen, offset));
+-    }
++    gu_trace(offset = Message::unserialize_common(buf, buflen, offset));
+     return offset;
+ }
+ 
+@@ -371,13 +371,9 @@ size_t gcomm::evs::GapMessage::serialize
+ 
+ size_t gcomm::evs::GapMessage::unserialize(const gu::byte_t* const buf,
+                                            size_t            const buflen,
+-                                           size_t                  offset,
+-                                           bool                    skip_header)
++                                           size_t                  offset)
+ {
+-    if (skip_header == false)
+-    {
+-        gu_trace(offset = Message::unserialize(buf, buflen, offset));
+-    }
++    gu_trace(offset = Message::unserialize_common(buf, buflen, offset));
+     gu_trace(offset = gu::unserialize8(buf, buflen, offset, seq_));
+     gu_trace(offset = gu::unserialize8(buf, buflen, offset, aru_seq_));
+     gu_trace(offset = range_uuid_.unserialize(buf, buflen, offset));
+@@ -406,13 +402,9 @@ size_t gcomm::evs::JoinMessage::serializ
+ 
+ size_t gcomm::evs::JoinMessage::unserialize(const gu::byte_t* const buf,
+                                             size_t            const buflen,
+-                                            size_t                  offset,
+-                                            bool                    skip_header)
++                                            size_t                  offset)
+ {
+-    if (skip_header == false)
+-    {
+-        gu_trace(offset = Message::unserialize(buf, buflen, offset));
+-    }
++    gu_trace(offset = Message::unserialize_common(buf, buflen, offset));
+     gu_trace(offset = gu::unserialize8(buf, buflen, offset, seq_));
+     gu_trace(offset = gu::unserialize8(buf, buflen, offset, aru_seq_));
+     node_list_.clear();
+@@ -441,13 +433,9 @@ size_t gcomm::evs::InstallMessage::seria
+ 
+ size_t gcomm::evs::InstallMessage::unserialize(const gu::byte_t* const buf,
+                                                size_t            const buflen,
+-                                               size_t                  offset,
+-                                               bool skip_header)
++                                               size_t                  offset)
+ {
+-    if (skip_header == false)
+-    {
+-        gu_trace(offset = Message::unserialize(buf, buflen, offset));
+-    }
++    gu_trace(offset = Message::unserialize_common(buf, buflen, offset));
+     gu_trace(offset = gu::unserialize8(buf, buflen, offset, seq_));
+     gu_trace(offset = gu::unserialize8(buf, buflen, offset, aru_seq_));
+     gu_trace(offset = install_view_id_.unserialize(buf, buflen, offset));
+@@ -477,13 +465,9 @@ size_t gcomm::evs::LeaveMessage::seriali
+ 
+ size_t gcomm::evs::LeaveMessage::unserialize(const gu::byte_t* const buf,
+                                              size_t            const buflen,
+-                                             size_t                  offset,
+-                                             bool skip_header)
++                                             size_t                  offset)
+ {
+-    if (skip_header == false)
+-    {
+-        gu_trace(offset = Message::unserialize(buf, buflen, offset));
+-    }
++    gu_trace(offset = Message::unserialize_common(buf, buflen, offset));
+     gu_trace(offset = gu::unserialize8(buf, buflen, offset, seq_));
+     gu_trace(offset = gu::unserialize8(buf, buflen, offset, aru_seq_));
+     return offset;
+@@ -512,13 +496,9 @@ size_t gcomm::evs::DelayedListMessage::s
+ 
+ size_t gcomm::evs::DelayedListMessage::unserialize(const gu::byte_t* const buf,
+                                                  size_t            const buflen,
+-                                                 size_t                  offset,
+-                                                 bool skip_header)
++                                                 size_t                  offset)
+ {
+-    if (skip_header == false)
+-    {
+-        gu_trace(offset = Message::unserialize(buf, buflen, offset));
+-    }
++    gu_trace(offset = Message::unserialize_common(buf, buflen, offset));
+     delayed_list_.clear();
+     uint8_t list_sz(0);
+     gu_trace(offset = gu::unserialize1(buf, buflen, offset, list_sz));
+--- a/gcomm/src/evs_message2.hpp
++++ b/gcomm/src/evs_message2.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2009-2019 Codership Oy <info@codership.com>
++ * Copyright (C) 2009-2023 Codership Oy <info@codership.com>
+  */
+ 
+ #ifndef EVS_MESSAGE2_HPP
+@@ -290,7 +290,17 @@ public:
+      */
+     gu::datetime::Date tstamp() const { return tstamp_; }
+ 
+-    size_t unserialize(const gu::byte_t* buf, size_t buflen, size_t offset);
++    /* Read type from message buffer. */
++    static Type get_type(const gu::byte_t* buf, size_t buflen, size_t offset);
++
++    /* Unserialize common header. */
++    size_t unserialize_common(const gu::byte_t* buf, size_t buflen,
++                              size_t offset);
++
++    /* Unserialize message. */
++    virtual size_t unserialize(const gu::byte_t* buf, size_t buflen,
++                               size_t offset)
++        = 0;
+ 
+     bool operator==(const Message& cmp) const;
+ 
+@@ -444,8 +454,7 @@ public:
+     void set_aru_seq(const seqno_t as) { aru_seq_ = as; }
+ 
+     size_t serialize(gu::byte_t* buf, size_t buflen, size_t offset) const;
+-    size_t unserialize(const gu::byte_t* buf, size_t buflen, size_t offset,
+-                       bool skip_header = false);
++    size_t unserialize(const gu::byte_t* buf, size_t buflen, size_t offset) override;
+     size_t serial_size() const;
+ 
+ };
+@@ -504,8 +513,8 @@ public:
+                 fifo_seq)
+     { }
+     size_t serialize(gu::byte_t* buf, size_t buflen, size_t offset) const;
+-    size_t unserialize(const gu::byte_t* buf, size_t buflen, size_t offset,
+-                       bool skip_header = false);
++    size_t unserialize(const gu::byte_t* buf, size_t buflen,
++                       size_t offset) override;
+     size_t serial_size() const;
+ };
+ 
+@@ -537,8 +546,8 @@ public:
+                 range)
+     { }
+     size_t serialize(gu::byte_t* buf, size_t buflen, size_t offset) const;
+-    size_t unserialize(const gu::byte_t* buf, size_t buflen, size_t offset,
+-                       bool skip_header = false);
++    size_t unserialize(const gu::byte_t* buf, size_t buflen,
++                       size_t offset) override;
+     size_t serial_size() const;
+ };
+ 
+@@ -569,8 +578,8 @@ public:
+                 node_list)
+     { }
+     size_t serialize(gu::byte_t* buf, size_t buflen, size_t offset) const;
+-    size_t unserialize(const gu::byte_t* buf, size_t buflen, size_t offset,
+-                       bool skip_header = false);
++    size_t unserialize(const gu::byte_t* buf, size_t buflen,
++                       size_t offset) override;
+     size_t serial_size() const;
+ };
+ 
+@@ -602,8 +611,8 @@ public:
+                 node_list)
+     { }
+     size_t serialize(gu::byte_t* buf, size_t buflen, size_t offset) const;
+-    size_t unserialize(const gu::byte_t* buf, size_t buflen, size_t offset,
+-                       bool skip_header = false);
++    size_t unserialize(const gu::byte_t* buf, size_t buflen,
++                       size_t offset) override;
+     size_t serial_size() const;
+ };
+ 
+@@ -631,8 +640,8 @@ public:
+                 flags)
+     { }
+     size_t serialize(gu::byte_t* buf, size_t buflen, size_t offset) const;
+-    size_t unserialize(const gu::byte_t* buf, size_t buflen, size_t offset,
+-                       bool skip_header = false);
++    size_t unserialize(const gu::byte_t* buf, size_t buflen,
++                       size_t offset) override;
+     size_t serial_size() const;
+ };
+ 
+@@ -662,8 +671,8 @@ public:
+     const DelayedList& delayed_list() const { return delayed_list_; }
+ 
+     size_t serialize(gu::byte_t* buf, size_t buflen, size_t offset) const;
+-    size_t unserialize(const gu::byte_t* buf, size_t buflen, size_t offset,
+-                       bool skip_header = false);
++    size_t unserialize(const gu::byte_t* buf, size_t buflen,
++                       size_t offset) override;
+     size_t serial_size() const;
+     bool operator==(const DelayedListMessage& cmp) const
+     {
+--- a/gcomm/src/evs_proto.cpp
++++ b/gcomm/src/evs_proto.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2009-2019 Codership Oy <info@codership.com>
++ * Copyright (C) 2009-2023 Codership Oy <info@codership.com>
+  */
+ 
+ #include "evs_proto.hpp"
+@@ -2490,67 +2490,63 @@ void gcomm::evs::Proto::handle_msg(const
+ // Protolay interface
+ ////////////////////////////////////////////////////////////////////////
+ 
+-size_t gcomm::evs::Proto::unserialize_message(const UUID& source,
+-                                              const Datagram& rb,
+-                                              Message* msg)
++std::pair<std::unique_ptr<gcomm::evs::Message>, size_t>
++gcomm::evs::Proto::unserialize_message(const UUID& source, const Datagram& rb)
+ {
+-    size_t offset;
++    size_t offset = 0;
+     const gu::byte_t* begin(gcomm::begin(rb));
+     const size_t available(gcomm::available(rb));
+-    gu_trace(offset = msg->unserialize(begin,
+-                                       available,
+-                                       0));
+-    if ((msg->flags() & Message::F_SOURCE) == 0)
++    std::unique_ptr<Message> ret;
++    switch (Message::get_type(begin, available, offset))
+     {
+-        assert(source != UUID::nil());
+-        gcomm_assert(source != UUID::nil());
+-        msg->set_source(source);
+-    }
+-
+-    switch (msg->type())
+-    {
+-    case Message::EVS_T_NONE:
+-        gu_throw_fatal;
+-        break;
++    case Message::EVS_T_NONE: gu_throw_fatal; break;
+     case Message::EVS_T_USER:
+-        gu_trace(offset = static_cast<UserMessage&>(*msg).unserialize(
+-                     begin, available, offset, true));
++        ret = std::unique_ptr<UserMessage>(new UserMessage);
++        gu_trace(offset = ret->unserialize(begin, available, offset));
+         break;
+     case Message::EVS_T_DELEGATE:
+-        gu_trace(offset = static_cast<DelegateMessage&>(*msg).unserialize(
+-                     begin, available, offset, true));
++        ret = std::unique_ptr<DelegateMessage>(new DelegateMessage);
++        gu_trace(offset = ret->unserialize(begin, available, offset));
+         break;
+     case Message::EVS_T_GAP:
+-        gu_trace(offset = static_cast<GapMessage&>(*msg).unserialize(
+-                     begin, available, offset, true));
++        ret = std::unique_ptr<GapMessage>(new GapMessage);
++        gu_trace(offset = ret->unserialize(begin, available, offset));
+         break;
+     case Message::EVS_T_JOIN:
+-        gu_trace(offset = static_cast<JoinMessage&>(*msg).unserialize(
+-                     begin, available, offset, true));
++        ret = std::unique_ptr<JoinMessage>(new JoinMessage);
++        gu_trace(offset = ret->unserialize(begin, available, offset));
+         break;
+     case Message::EVS_T_INSTALL:
+-        gu_trace(offset = static_cast<InstallMessage&>(*msg).unserialize(
+-                     begin, available, offset, true));
++        ret = std::unique_ptr<InstallMessage>(new InstallMessage);
++        gu_trace(offset = ret->unserialize(begin, available, offset));
+         break;
+     case Message::EVS_T_LEAVE:
+-        gu_trace(offset = static_cast<LeaveMessage&>(*msg).unserialize(
+-                     begin, available, offset, true));
++        ret = std::unique_ptr<LeaveMessage>(new LeaveMessage);
++        gu_trace(offset = ret->unserialize(begin, available, offset));
+         break;
+     case Message::EVS_T_DELAYED_LIST:
+-        gu_trace(offset = static_cast<DelayedListMessage&>(*msg).unserialize(
+-                     begin, available, offset, true));
++        ret = std::unique_ptr<DelayedListMessage>(new DelayedListMessage);
++        gu_trace(offset = ret->unserialize(begin, available, offset));
+         break;
++    default:
++        return {std::unique_ptr<Message>{}, 0};
+     }
+-    return (offset + rb.offset());
++
++    /* Message did not have source field, must be set from source reported
++       by the lower layer. */
++    if ((ret->flags() & Message::F_SOURCE) == 0)
++    {
++        assert(source != UUID::nil());
++        gcomm_assert(source != UUID::nil());
++        ret->set_source(source);
++    }
++
++    return {std::move(ret), offset + rb.offset()};
+ }
+ 
+-void gcomm::evs::Proto::handle_up(const void* cid,
+-                                  const Datagram& rb,
++void gcomm::evs::Proto::handle_up(const void* cid, const Datagram& rb,
+                                   const ProtoUpMeta& um)
+ {
+-
+-    Message msg;
+-
+     if (state() == S_CLOSED || um.source() == uuid() || is_evicted(um.source()))
+     {
+         // Silent drop
+@@ -2559,12 +2555,16 @@ void gcomm::evs::Proto::handle_up(const
+ 
+     gcomm_assert(um.source() != UUID::nil());
+ 
++    std::pair<std::unique_ptr<Message>, size_t> msg;
+     try
+     {
+-        size_t offset;
+-        gu_trace(offset = unserialize_message(um.source(), rb, &msg));
+-        handle_msg(msg, Datagram(rb, offset),
+-                   (msg.flags() & Message::F_RETRANS) == 0);
++        gu_trace(msg = unserialize_message(um.source(), rb));
++        if (not msg.first) {
++            /* Message could not be serialized. */
++            return;
++        }
++        handle_msg(*msg.first, Datagram(rb, msg.second),
++                   (msg.first->flags() & Message::F_RETRANS) == 0);
+     }
+     catch (gu::Exception& e)
+     {
+@@ -2575,11 +2575,11 @@ void gcomm::evs::Proto::handle_up(const
+             break;
+ 
+         case EINVAL:
+-            log_warn << "invalid message: " << msg;
++            log_warn << "invalid message: " << *msg.first;
+             break;
+ 
+         default:
+-            log_fatal << "exception caused by message: " << msg;
++            log_fatal << "exception caused by message: " << *msg.first;
+             std::cerr << " state after handling message: " << *this;
+             throw;
+         }
+@@ -3791,20 +3791,20 @@ void gcomm::evs::Proto::handle_user(cons
+     }
+ }
+ 
+-
+ void gcomm::evs::Proto::handle_delegate(const DelegateMessage& msg,
+                                         NodeMap::iterator ii,
+                                         const Datagram& rb)
+ {
+     gcomm_assert(ii != known_.end());
+     evs_log_debug(D_DELEGATE_MSGS) << "delegate message " << msg;
+-    Message umsg;
+-    size_t offset;
+-    gu_trace(offset = unserialize_message(UUID::nil(), rb, &umsg));
+-    gu_trace(handle_msg(umsg, Datagram(rb, offset), false));
++    std::pair<std::unique_ptr<Message>, size_t> umsg;
++    gu_trace(umsg = unserialize_message(UUID::nil(), rb));
++    if (not umsg.first) {
++        return;
++    }
++    gu_trace(handle_msg(*umsg.first, Datagram(rb, umsg.second), false));
+ }
+ 
+-
+ void gcomm::evs::Proto::handle_gap(const GapMessage& msg, NodeMap::iterator ii)
+ {
+     assert(ii != known_.end());
+--- a/gcomm/src/evs_proto.hpp
++++ b/gcomm/src/evs_proto.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2009-2019 Codership Oy <info@codership.com>
++ * Copyright (C) 2009-2023 Codership Oy <info@codership.com>
+  */
+ 
+ /*!
+@@ -288,11 +288,9 @@ private:
+     void populate_node_list(MessageNodeList*) const;
+     void isolate(gu::datetime::Period period);
+ public:
+-    static size_t unserialize_message(const UUID&,
+-                                      const Datagram&,
+-                                      Message*);
+-    void handle_msg(const Message& msg,
+-                    const Datagram& dg = Datagram(),
++    static std::pair<std::unique_ptr<gcomm::evs::Message>, size_t>
++    unserialize_message(const UUID&, const Datagram&);
++    void handle_msg(const Message& msg, const Datagram& dg = Datagram(),
+                     bool direct = true);
+     // Protolay
+     void handle_up(const void*, const Datagram&, const ProtoUpMeta&);
+--- a/gcomm/test/check_evs2.cpp
++++ b/gcomm/test/check_evs2.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2009-2020 Codership Oy <info@codership.com>
++ * Copyright (C) 2009-2023 Codership Oy <info@codership.com>
+  */
+ 
+ /*!
+@@ -455,12 +455,13 @@ START_TEST(test_input_map_gap_range_list
+ }
+ END_TEST
+ 
+-static Datagram* get_msg(DummyTransport* tp, Message* msg, bool release = true)
++static Datagram* get_msg(DummyTransport* tp, std::unique_ptr<Message>& msg,
++                         bool release = true)
+ {
+     Datagram* rb = tp->out();
+     if (rb != 0)
+     {
+-        gu_trace(Proto::unserialize_message(tp->uuid(), *rb, msg));
++        msg = Proto::unserialize_message(tp->uuid(), *rb).first;
+         if (release == true)
+         {
+             delete rb;
+@@ -471,7 +472,7 @@ static Datagram* get_msg(DummyTransport*
+ 
+ static void single_join(DummyTransport* t, Proto* p)
+ {
+-    Message jm, im, gm;
++    std::unique_ptr<Message> jm, im, gm;
+ 
+     // Initial state is joining
+     p->shift_to(Proto::S_JOINING);
+@@ -479,42 +480,42 @@ static void single_join(DummyTransport*
+     // Send join must produce emitted join message
+     p->send_join();
+ 
+-    Datagram* rb = get_msg(t, &jm);
++    Datagram* rb = get_msg(t, jm);
+     ck_assert(rb != 0);
+-    ck_assert(jm.type() == Message::EVS_T_JOIN);
++    ck_assert(jm->type() == Message::EVS_T_JOIN);
+ 
+     // Install message is emitted at the end of JOIN handling
+     // 'cause this is the only instance and is always consistent
+     // with itself
+-    rb = get_msg(t, &im);
++    rb = get_msg(t, im);
+     ck_assert(rb != 0);
+-    ck_assert(im.type() == Message::EVS_T_INSTALL);
++    ck_assert(im->type() == Message::EVS_T_INSTALL);
+ 
+     // Handling INSTALL message emits three gap messages,
+     // one for receiving install message (commit gap), one for
+     // shift to install and one for shift to operational
+-    rb = get_msg(t, &gm);
++    rb = get_msg(t, gm);
+     ck_assert(rb != 0);
+-    ck_assert(gm.type() == Message::EVS_T_GAP);
+-    ck_assert((gm.flags() & Message::F_COMMIT) != 0);
++    ck_assert(gm->type() == Message::EVS_T_GAP);
++    ck_assert((gm->flags() & Message::F_COMMIT) != 0);
+ 
+-    rb = get_msg(t, &gm);
++    rb = get_msg(t, gm);
+     ck_assert(rb != 0);
+-    ck_assert(gm.type() == Message::EVS_T_GAP);
+-    ck_assert((gm.flags() & Message::F_COMMIT) == 0);
++    ck_assert(gm->type() == Message::EVS_T_GAP);
++    ck_assert((gm->flags() & Message::F_COMMIT) == 0);
+ 
+-    rb = get_msg(t, &gm);
++    rb = get_msg(t, gm);
+     ck_assert(rb != 0);
+-    ck_assert(gm.type() == Message::EVS_T_GAP);
+-    ck_assert((gm.flags() & Message::F_COMMIT) == 0);
++    ck_assert(gm->type() == Message::EVS_T_GAP);
++    ck_assert((gm->flags() & Message::F_COMMIT) == 0);
+ 
+     // State must have evolved JOIN -> S_GATHER -> S_INSTALL -> S_OPERATIONAL
+     ck_assert(p->state() == Proto::S_OPERATIONAL);
+ 
+     // Handle join message again, must stay in S_OPERATIONAL, must not
+     // emit anything
+-    p->handle_msg(jm);
+-    rb = get_msg(t, &gm);
++    p->handle_msg(*jm);
++    rb = get_msg(t, gm);
+     ck_assert(rb == 0);
+     ck_assert(p->state() == Proto::S_OPERATIONAL);
+ 
+@@ -553,11 +554,11 @@ static void double_join(DummyTransport*
+                         DummyTransport* t2, Proto* p2)
+ {
+ 
+-    Message jm;
+-    Message im;
+-    Message gm;
+-    Message gm2;
+-    Message msg;
++    std::unique_ptr<Message> jm;
++    std::unique_ptr<Message> im;
++    std::unique_ptr<Message> gm;
++    std::unique_ptr<Message> gm2;
++    std::unique_ptr<Message> msg;
+ 
+     Datagram* rb;
+ 
+@@ -570,99 +571,99 @@ static void double_join(DummyTransport*
+     // Expected output: one join message
+     p2->send_join(false);
+     ck_assert(p2->state() == Proto::S_JOINING);
+-    rb = get_msg(t2, &jm);
++    rb = get_msg(t2, jm);
+     ck_assert(rb != 0);
+-    ck_assert(jm.type() == Message::EVS_T_JOIN);
+-    rb = get_msg(t2, &msg);
++    ck_assert(jm->type() == Message::EVS_T_JOIN);
++    rb = get_msg(t2, msg);
+     ck_assert(rb == 0);
+ 
+     // Handle node 2's join on node 1
+     // Expected output: shift to S_GATHER and one join message
+-    p1->handle_msg(jm);
++    p1->handle_msg(*jm);
+     ck_assert(p1->state() == Proto::S_GATHER);
+-    rb = get_msg(t1, &jm);
++    rb = get_msg(t1, jm);
+     ck_assert(rb != 0);
+-    ck_assert(jm.type() == Message::EVS_T_JOIN);
+-    rb = get_msg(t1, &msg);
++    ck_assert(jm->type() == Message::EVS_T_JOIN);
++    rb = get_msg(t1, msg);
+     ck_assert(rb == 0);
+ 
+     // Handle node 1's join on node 2
+     // Expected output: shift to S_GATHER and one join message
+-    p2->handle_msg(jm);
++    p2->handle_msg(*jm);
+     ck_assert(p2->state() == Proto::S_GATHER);
+-    rb = get_msg(t2, &jm);
++    rb = get_msg(t2, jm);
+     ck_assert(rb != 0);
+-    ck_assert(jm.type() == Message::EVS_T_JOIN);
+-    rb = get_msg(t2, &msg);
++    ck_assert(jm->type() == Message::EVS_T_JOIN);
++    rb = get_msg(t2, msg);
+     ck_assert(rb == 0);
+ 
+     // Handle node 2's join on node 1
+     // Expected output: Install and commit gap messages, state stays in S_GATHER
+-    p1->handle_msg(jm);
++    p1->handle_msg(*jm);
+     ck_assert(p1->state() == Proto::S_GATHER);
+-    rb = get_msg(t1, &im);
++    rb = get_msg(t1, im);
+     ck_assert(rb != 0);
+-    ck_assert(im.type() == Message::EVS_T_INSTALL);
+-    rb = get_msg(t1, &gm);
++    ck_assert(im->type() == Message::EVS_T_INSTALL);
++    rb = get_msg(t1, gm);
+     ck_assert(rb != 0);
+-    ck_assert(gm.type() == Message::EVS_T_GAP);
+-    ck_assert((gm.flags() & Message::F_COMMIT) != 0);
+-    rb = get_msg(t1, &msg);
++    ck_assert(gm->type() == Message::EVS_T_GAP);
++    ck_assert((gm->flags() & Message::F_COMMIT) != 0);
++    rb = get_msg(t1, msg);
+     ck_assert(rb == 0);
+ 
+     // Handle install message on node 2
+     // Expected output: commit gap message and state stays in S_RECOVERY
+-    p2->handle_msg(im);
++    p2->handle_msg(*im);
+     ck_assert(p2->state() == Proto::S_GATHER);
+-    rb = get_msg(t2, &gm2);
++    rb = get_msg(t2, gm2);
+     ck_assert(rb != 0);
+-    ck_assert(gm2.type() == Message::EVS_T_GAP);
+-    ck_assert((gm2.flags() & Message::F_COMMIT) != 0);
+-    rb = get_msg(t2, &msg);
++    ck_assert(gm2->type() == Message::EVS_T_GAP);
++    ck_assert((gm2->flags() & Message::F_COMMIT) != 0);
++    rb = get_msg(t2, msg);
+     ck_assert(rb == 0);
+ 
+     // Handle gap messages
+     // Expected output: Both nodes shift to S_INSTALL,
+     // both send gap messages
+-    p1->handle_msg(gm2);
++    p1->handle_msg(*gm2);
+     ck_assert(p1->state() == Proto::S_INSTALL);
+-    Message gm12;
+-    rb = get_msg(t1, &gm12);
++    std::unique_ptr<Message> gm12;
++    rb = get_msg(t1, gm12);
+     ck_assert(rb != 0);
+-    ck_assert(gm12.type() == Message::EVS_T_GAP);
+-    ck_assert((gm12.flags() & Message::F_COMMIT) == 0);
+-    rb = get_msg(t1, &msg);
++    ck_assert(gm12->type() == Message::EVS_T_GAP);
++    ck_assert((gm12->flags() & Message::F_COMMIT) == 0);
++    rb = get_msg(t1, msg);
+     ck_assert(rb == 0);
+ 
+-    p2->handle_msg(gm);
++    p2->handle_msg(*gm);
+     ck_assert(p2->state() == Proto::S_INSTALL);
+-    Message gm22;
+-    rb = get_msg(t2, &gm22);
++    std::unique_ptr<Message> gm22;
++    rb = get_msg(t2, gm22);
+     ck_assert(rb != 0);
+-    ck_assert(gm22.type() == Message::EVS_T_GAP);
+-    ck_assert((gm22.flags() & Message::F_COMMIT) == 0);
+-    rb = get_msg(t2, &msg);
++    ck_assert(gm22->type() == Message::EVS_T_GAP);
++    ck_assert((gm22->flags() & Message::F_COMMIT) == 0);
++    rb = get_msg(t2, msg);
+     ck_assert(rb == 0);
+ 
+     // Handle final gap messages, expected output shift to operational
+     // and gap message
+ 
+-    p1->handle_msg(gm22);
++    p1->handle_msg(*gm22);
+     ck_assert(p1->state() == Proto::S_OPERATIONAL);
+-    rb = get_msg(t1, &msg);
++    rb = get_msg(t1, msg);
+     ck_assert(rb != 0);
+-    ck_assert(msg.type() == Message::EVS_T_GAP);
+-    ck_assert((msg.flags() & Message::F_COMMIT) == 0);
+-    rb = get_msg(t1, &msg);
++    ck_assert(msg->type() == Message::EVS_T_GAP);
++    ck_assert((msg->flags() & Message::F_COMMIT) == 0);
++    rb = get_msg(t1, msg);
+     ck_assert(rb == 0);
+ 
+-    p2->handle_msg(gm12);
++    p2->handle_msg(*gm12);
+     ck_assert(p2->state() == Proto::S_OPERATIONAL);
+-    rb = get_msg(t2, &msg);
++    rb = get_msg(t2, msg);
+     ck_assert(rb != 0);
+-    ck_assert(msg.type() == Message::EVS_T_GAP);
+-    ck_assert((msg.flags() & Message::F_COMMIT) == 0);
+-    rb = get_msg(t2, &msg);
++    ck_assert(msg->type() == Message::EVS_T_GAP);
++    ck_assert((msg->flags() & Message::F_COMMIT) == 0);
++    rb = get_msg(t2, msg);
+     ck_assert(rb == 0);
+ 
+ }
+@@ -2031,12 +2032,12 @@ START_TEST(test_gh_100)
+     // install message is generated. After that handle install timer
+     // on p1 and verify that the newly generated install message has
+     // greater install view id seqno than the first one.
+-    Message jm;
+-    Message im;
+-    Message im2;
+-    Message gm;
+-    Message gm2;
+-    Message msg;
++    std::unique_ptr<Message> jm;
++    std::unique_ptr<Message> im;
++    std::unique_ptr<Message> im2;
++    std::unique_ptr<Message> gm;
++    std::unique_ptr<Message> gm2;
++    std::unique_ptr<Message> msg;
+ 
+     Datagram* rb;
+ 
+@@ -2049,56 +2050,56 @@ START_TEST(test_gh_100)
+     // Expected output: one join message
+     p2.send_join(false);
+     ck_assert(p2.state() == Proto::S_JOINING);
+-    rb = get_msg(&t2, &jm);
++    rb = get_msg(&t2, jm);
+     ck_assert(rb != 0);
+-    ck_assert(jm.type() == Message::EVS_T_JOIN);
+-    rb = get_msg(&t2, &msg);
++    ck_assert(jm->type() == Message::EVS_T_JOIN);
++    rb = get_msg(&t2, msg);
+     ck_assert(rb == 0);
+ 
+     // Handle node 2's join on node 1
+     // Expected output: shift to S_GATHER and one join message
+-    p1.handle_msg(jm);
++    p1.handle_msg(*jm);
+     ck_assert(p1.state() == Proto::S_GATHER);
+-    rb = get_msg(&t1, &jm);
++    rb = get_msg(&t1, jm);
+     ck_assert(rb != 0);
+-    ck_assert(jm.type() == Message::EVS_T_JOIN);
+-    rb = get_msg(&t1, &msg);
++    ck_assert(jm->type() == Message::EVS_T_JOIN);
++    rb = get_msg(&t1, msg);
+     ck_assert(rb == 0);
+ 
+     // Handle node 1's join on node 2
+     // Expected output: shift to S_GATHER and one join message
+-    p2.handle_msg(jm);
++    p2.handle_msg(*jm);
+     ck_assert(p2.state() == Proto::S_GATHER);
+-    rb = get_msg(&t2, &jm);
++    rb = get_msg(&t2, jm);
+     ck_assert(rb != 0);
+-    ck_assert(jm.type() == Message::EVS_T_JOIN);
+-    rb = get_msg(&t2, &msg);
++    ck_assert(jm->type() == Message::EVS_T_JOIN);
++    rb = get_msg(&t2, msg);
+     ck_assert(rb == 0);
+ 
+     // Handle node 2's join on node 1
+     // Expected output: Install and commit gap messages, state stays in S_GATHER
+-    p1.handle_msg(jm);
++    p1.handle_msg(*jm);
+     ck_assert(p1.state() == Proto::S_GATHER);
+-    rb = get_msg(&t1, &im);
++    rb = get_msg(&t1, im);
+     ck_assert(rb != 0);
+-    ck_assert(im.type() == Message::EVS_T_INSTALL);
+-    rb = get_msg(&t1, &gm);
++    ck_assert(im->type() == Message::EVS_T_INSTALL);
++    rb = get_msg(&t1, gm);
+     ck_assert(rb != 0);
+-    ck_assert(gm.type() == Message::EVS_T_GAP);
+-    ck_assert((gm.flags() & Message::F_COMMIT) != 0);
+-    rb = get_msg(&t1, &msg);
++    ck_assert(gm->type() == Message::EVS_T_GAP);
++    ck_assert((gm->flags() & Message::F_COMMIT) != 0);
++    rb = get_msg(&t1, msg);
+     ck_assert(rb == 0);
+ 
+     // Handle timers to  to generate shift to GATHER
+     p1.handle_inactivity_timer();
+     p1.handle_install_timer();
+-    rb = get_msg(&t1, &jm);
++    rb = get_msg(&t1, jm);
+     ck_assert(rb != 0);
+-    ck_assert(jm.type() == Message::EVS_T_JOIN);
+-    rb = get_msg(&t1, &im2);
++    ck_assert(jm->type() == Message::EVS_T_JOIN);
++    rb = get_msg(&t1, im2);
+     ck_assert(rb != 0);
+-    ck_assert(im2.type() == Message::EVS_T_INSTALL);
+-    ck_assert(im2.install_view_id().seq() > im.install_view_id().seq());
++    ck_assert(im2->type() == Message::EVS_T_INSTALL);
++    ck_assert(im2->install_view_id().seq() > im->install_view_id().seq());
+ 
+     gcomm::Datagram* tmp;
+     while ((tmp = t1.out())) delete tmp;
+@@ -2195,14 +2196,14 @@ START_TEST(test_gal_521)
+     ck_assert(t2->empty() == false);
+ 
+     Datagram *d1;
+-    Message um1;
+-    ck_assert((d1 = get_msg(t1, &um1, false)) != 0);
+-    ck_assert(um1.type() == Message::EVS_T_USER);
++    std::unique_ptr<Message> um1;
++    ck_assert((d1 = get_msg(t1, um1, false)) != 0);
++    ck_assert(um1->type() == Message::EVS_T_USER);
+     ck_assert(t1->empty() == true);
+     Datagram *d2;
+-    Message um2;
+-    ck_assert((d2 = get_msg(t2, &um2, false)) != 0);
+-    ck_assert(um2.type() == Message::EVS_T_USER);
++    std::unique_ptr<Message> um2;
++    ck_assert((d2 = get_msg(t2, um2, false)) != 0);
++    ck_assert(um2->type() == Message::EVS_T_USER);
+     ck_assert(t2->empty() == true);
+ 
+     // Both of the nodes handle each other's messages. Now due to
+@@ -2211,53 +2212,53 @@ START_TEST(test_gal_521)
+     // must emit gap messages to make safe_seq to progress.
+     evs1->handle_up(0, *d2, ProtoUpMeta(dn[1]->uuid()));
+     delete d2;
+-    Message gm1;
+-    ck_assert(get_msg(t1, &gm1) != 0);
+-    ck_assert(gm1.type() == Message::EVS_T_GAP);
++    std::unique_ptr<Message> gm1;
++    ck_assert(get_msg(t1, gm1) != 0);
++    ck_assert(gm1->type() == Message::EVS_T_GAP);
+     ck_assert(t1->empty() == true);
+ 
+     evs2->handle_up(0, *d1, ProtoUpMeta(dn[0]->uuid()));
+     delete d1;
+-    Message gm2;
+-    ck_assert(get_msg(t2, &gm2) != 0);
+-    ck_assert(gm2.type() == Message::EVS_T_GAP);
++    std::unique_ptr<Message> gm2;
++    ck_assert(get_msg(t2, gm2) != 0);
++    ck_assert(gm2->type() == Message::EVS_T_GAP);
+     ck_assert(t2->empty() == true);
+ 
+     // Handle gap messages. The safe_seq is now incremented so the
+     // second user messages are now sent from output queue.
+-    evs1->handle_msg(gm2);
+-    ck_assert((d1 = get_msg(t1, &um1, false)) != 0);
+-    ck_assert(um1.type() == Message::EVS_T_USER);
++    evs1->handle_msg(*gm2);
++    ck_assert((d1 = get_msg(t1, um1, false)) != 0);
++    ck_assert(um1->type() == Message::EVS_T_USER);
+     ck_assert(t1->empty() == true);
+ 
+-    evs2->handle_msg(gm1);
+-    ck_assert((d2 = get_msg(t2, &um2, false)) != 0);
+-    ck_assert(um2.type() == Message::EVS_T_USER);
++    evs2->handle_msg(*gm1);
++    ck_assert((d2 = get_msg(t2, um2, false)) != 0);
++    ck_assert(um2->type() == Message::EVS_T_USER);
+     ck_assert(t2->empty() == true);
+ 
+     // Handle user messages. Each node should now emit gap
+     // because the output queue is empty.
+     evs1->handle_up(0, *d2, ProtoUpMeta(dn[1]->uuid()));
+     delete d2;
+-    ck_assert(get_msg(t1, &gm1) != 0);
+-    ck_assert(gm1.type() == Message::EVS_T_GAP);
++    ck_assert(get_msg(t1, gm1) != 0);
++    ck_assert(gm1->type() == Message::EVS_T_GAP);
+     ck_assert(t1->empty() == true);
+ 
+     evs2->handle_up(0, *d1, ProtoUpMeta(dn[0]->uuid()));
+     delete d1;
+-    ck_assert(get_msg(t2, &gm2) != 0);
+-    ck_assert(gm2.type() == Message::EVS_T_GAP);
++    ck_assert(get_msg(t2, gm2) != 0);
++    ck_assert(gm2->type() == Message::EVS_T_GAP);
+     ck_assert(t2->empty() == true);
+ 
+     // Handle gap messages. No further messages should be emitted
+     // since both user messages have been delivered, there are
+     // no pending user messages in the output queue and no timers
+     // have been expired.
+-    evs1->handle_msg(gm2);
+-    ck_assert((d1 = get_msg(t1, &um1, false)) == 0);
++    evs1->handle_msg(*gm2);
++    ck_assert((d1 = get_msg(t1, um1, false)) == 0);
+ 
+-    evs2->handle_msg(gm1);
+-    ck_assert((d2 = get_msg(t2, &um2, false)) == 0);
++    evs2->handle_msg(*gm1);
++    ck_assert((d2 = get_msg(t2, um2, false)) == 0);
+ 
+ 
+     std::for_each(dn.begin(), dn.end(), DeleteObject());
+@@ -2332,70 +2333,70 @@ START_TEST(test_gap_rate_limit)
+     // the rest are handled by node2 for generating gap messages.
+     f.evs1.handle_down(dg, ProtoDownMeta(O_SAFE));
+     gcomm::Datagram* read_dg;
+-    gcomm::evs::Message um1;
+-    read_dg = get_msg(&f.tr1, &um1);
++    std::unique_ptr<gcomm::evs::Message> um1;
++    read_dg = get_msg(&f.tr1, um1);
+     ck_assert(read_dg != 0);
+     f.evs1.handle_down(dg, ProtoDownMeta(O_SAFE));
+-    gcomm::evs::Message um2;
+-    read_dg = get_msg(&f.tr1, &um2);
++    std::unique_ptr<gcomm::evs::Message> um2;
++    read_dg = get_msg(&f.tr1, um2);
+     ck_assert(read_dg != 0);
+     f.evs1.handle_down(dg, ProtoDownMeta(O_SAFE));
+-    gcomm::evs::Message um3;
+-    read_dg = get_msg(&f.tr1, &um3);
++    std::unique_ptr<gcomm::evs::Message> um3;
++    read_dg = get_msg(&f.tr1, um3);
+     ck_assert(read_dg != 0);
+     f.evs1.handle_down(dg, ProtoDownMeta(O_SAFE));
+-    gcomm::evs::Message um4;
+-    read_dg = get_msg(&f.tr1, &um4);
++    std::unique_ptr<gcomm::evs::Message> um4;
++    read_dg = get_msg(&f.tr1, um4);
+     ck_assert(read_dg != 0);
+ 
+     // Make node2 handle an out of order message and verify that gap is emitted
+-    f.evs2.handle_msg(um2);
+-    gcomm::evs::Message gm1;
+-    read_dg = get_msg(&f.tr2, &gm1);
++    f.evs2.handle_msg(*um2);
++    std::unique_ptr<gcomm::evs::Message> gm1;
++    read_dg = get_msg(&f.tr2, gm1);
+     ck_assert(read_dg != 0);
+-    ck_assert(gm1.type() == gcomm::evs::Message::EVS_T_GAP);
+-    ck_assert(gm1.range_uuid() == f.uuid1);
+-    ck_assert(gm1.range().lu() == 0);
+-    ck_assert(gm1.range().hs() == 0);
++    ck_assert(gm1->type() == gcomm::evs::Message::EVS_T_GAP);
++    ck_assert(gm1->range_uuid() == f.uuid1);
++    ck_assert(gm1->range().lu() == 0);
++    ck_assert(gm1->range().hs() == 0);
+     // The node2 will also send an user message to complete the sequence
+     // number. Consume it.
+-    gcomm::evs::Message comp_um1;
+-    read_dg = get_msg(&f.tr2, &comp_um1);
++    std::unique_ptr<gcomm::evs::Message> comp_um1;
++    read_dg = get_msg(&f.tr2, comp_um1);
+     ck_assert(read_dg != 0);
+-    ck_assert(comp_um1.type() == gcomm::evs::Message::EVS_T_USER);
+-    ck_assert(comp_um1.seq() + comp_um1.seq_range() == 1);
++    ck_assert(comp_um1->type() == gcomm::evs::Message::EVS_T_USER);
++    ck_assert(comp_um1->seq() + comp_um1->seq_range() == 1);
+     // No further messages should be emitted
+-    read_dg = get_msg(&f.tr2, &comp_um1);
++    read_dg = get_msg(&f.tr2, comp_um1);
+     ck_assert(read_dg == 0);
+ 
+     // Handle the second out of order message, gap should not be emitted.
+     // There will be a next user message which completes the um3.
+-    f.evs2.handle_msg(um3);
+-    gcomm::evs::Message comp_um2;
+-    read_dg = get_msg(&f.tr2, &comp_um2);
++    f.evs2.handle_msg(*um3);
++    std::unique_ptr<gcomm::evs::Message> comp_um2;
++    read_dg = get_msg(&f.tr2, comp_um2);
+     ck_assert(read_dg != 0);
+-    ck_assert(comp_um2.type() == gcomm::evs::Message::EVS_T_USER);
+-    ck_assert(comp_um2.seq() + comp_um2.seq_range() == 2);
++    ck_assert(comp_um2->type() == gcomm::evs::Message::EVS_T_USER);
++    ck_assert(comp_um2->seq() + comp_um2->seq_range() == 2);
+ 
+     // There should not be any more gap messages.
+-    read_dg = get_msg(&f.tr2, &gm1);
++    read_dg = get_msg(&f.tr2, gm1);
+     ck_assert(read_dg == 0);
+ 
+     // Move the clock forwards and handle the fourth message, gap should
+     // now emitted.
+     gu::datetime::SimClock::inc_time(100*gu::datetime::MSec);
+-    gcomm::evs::Message gm2;
+-    f.evs2.handle_msg(um4);
+-    read_dg = get_msg(&f.tr2, &gm2);
++    std::unique_ptr<gcomm::evs::Message> gm2;
++    f.evs2.handle_msg(*um4);
++    read_dg = get_msg(&f.tr2, gm2);
+     ck_assert(read_dg != 0);
+-    ck_assert(gm2.type() == gcomm::evs::Message::EVS_T_GAP);
+-    ck_assert(gm2.range().lu() == 0);
+-    ck_assert(gm2.range().hs() == 0);
++    ck_assert(gm2->type() == gcomm::evs::Message::EVS_T_GAP);
++    ck_assert(gm2->range().lu() == 0);
++    ck_assert(gm2->range().hs() == 0);
+ 
+-    gcomm::evs::Message comp_u4;
+-    read_dg = get_msg(&f.tr2, &comp_u4);
++    std::unique_ptr<gcomm::evs::Message> comp_u4;
++    read_dg = get_msg(&f.tr2, comp_u4);
+     ck_assert(read_dg != 0);
+-    ck_assert(comp_u4.type() == gcomm::evs::Message::EVS_T_USER);
++    ck_assert(comp_u4->type() == gcomm::evs::Message::EVS_T_USER);
+     log_info << "END test_gap_rate_limit";
+ }
+ END_TEST
+@@ -2427,75 +2428,75 @@ START_TEST(test_gap_rate_limit_delayed)
+     // the rest are handled by node2 for generating gap messages.
+     f.evs1.handle_down(dg, ProtoDownMeta(O_SAFE));
+     gcomm::Datagram* read_dg;
+-    gcomm::evs::Message um1;
+-    read_dg = get_msg(&f.tr1, &um1);
++    std::unique_ptr<gcomm::evs::Message> um1;
++    read_dg = get_msg(&f.tr1, um1);
+     ck_assert(read_dg != 0);
+     f.evs1.handle_down(dg, ProtoDownMeta(O_SAFE));
+-    gcomm::evs::Message um2;
+-    read_dg = get_msg(&f.tr1, &um2);
++    std::unique_ptr<gcomm::evs::Message> um2;
++    read_dg = get_msg(&f.tr1, um2);
+     ck_assert(read_dg != 0);
+     f.evs1.handle_down(dg, ProtoDownMeta(O_SAFE));
+-    gcomm::evs::Message um3;
+-    read_dg = get_msg(&f.tr1, &um3);
++    std::unique_ptr<gcomm::evs::Message> um3;
++    read_dg = get_msg(&f.tr1, um3);
+     ck_assert(read_dg != 0);
+     f.evs1.handle_down(dg, ProtoDownMeta(O_SAFE));
+-    gcomm::evs::Message um4;
+-    read_dg = get_msg(&f.tr1, &um4);
++    std::unique_ptr<gcomm::evs::Message> um4;
++    read_dg = get_msg(&f.tr1, um4);
+     ck_assert(read_dg != 0);
+ 
+     // Make node2 handle an out of order message and verify that gap is emitted
+-    f.evs2.handle_msg(um2);
+-    gcomm::evs::Message gm1;
+-    read_dg = get_msg(&f.tr2, &gm1);
++    f.evs2.handle_msg(*um2);
++    std::unique_ptr<gcomm::evs::Message> gm1;
++    read_dg = get_msg(&f.tr2, gm1);
+     ck_assert(read_dg != 0);
+-    ck_assert(gm1.type() == gcomm::evs::Message::EVS_T_GAP);
+-    ck_assert(gm1.range_uuid() == f.uuid1);
+-    ck_assert(gm1.range().lu() == 0);
+-    ck_assert(gm1.range().hs() == 0);
++    ck_assert(gm1->type() == gcomm::evs::Message::EVS_T_GAP);
++    ck_assert(gm1->range_uuid() == f.uuid1);
++    ck_assert(gm1->range().lu() == 0);
++    ck_assert(gm1->range().hs() == 0);
+     // The node2 will also send an user message to complete the sequence
+     // number. Consume it.
+-    gcomm::evs::Message comp_um1;
+-    read_dg = get_msg(&f.tr2, &comp_um1);
++    std::unique_ptr<gcomm::evs::Message> comp_um1;
++    read_dg = get_msg(&f.tr2, comp_um1);
+     ck_assert(read_dg != 0);
+-    ck_assert(comp_um1.type() == gcomm::evs::Message::EVS_T_USER);
+-    ck_assert(comp_um1.seq() + comp_um1.seq_range() == 1);
++    ck_assert(comp_um1->type() == gcomm::evs::Message::EVS_T_USER);
++    ck_assert(comp_um1->seq() + comp_um1->seq_range() == 1);
+     // No further messages should be emitted
+-    read_dg = get_msg(&f.tr2, &comp_um1);
++    read_dg = get_msg(&f.tr2, comp_um1);
+     ck_assert(read_dg == 0);
+ 
+     // Move time forwards in 1 sec interval and make inactivity check
+     // in between. No gap messages should be emitted.
+     gu::datetime::SimClock::inc_time(gu::datetime::Sec);
+     f.evs2.handle_inactivity_timer();
+-    gcomm::evs::Message gm_discard;
+-    read_dg = get_msg(&f.tr2, &gm_discard);
++    std::unique_ptr<gcomm::evs::Message> gm_discard;
++    read_dg = get_msg(&f.tr2, gm_discard);
+     ck_assert(read_dg == 0);
+     // The clock is now advanced over retrans_period + delay margin. Next
+     // call to handle_inactivity_timer() should fire the check. Gap message
+     // is emitted.
+     gu::datetime::SimClock::inc_time(gu::datetime::Sec);
+     f.evs2.handle_inactivity_timer();
+-    read_dg = get_msg(&f.tr2, &gm1);
++    read_dg = get_msg(&f.tr2, gm1);
+     ck_assert(read_dg != 0);
+-    ck_assert(gm1.type() == gcomm::evs::Message::EVS_T_GAP);
++    ck_assert(gm1->type() == gcomm::evs::Message::EVS_T_GAP);
+     // Now call handle_inactivity_timer() again, gap message should not
+     // be emitted due to rate limit.
+     // Galera 4 will run with evs protocol version 1 and will emit
+     // delayed list at this point.
+     f.evs2.handle_inactivity_timer();
+-    gcomm::evs::Message dm;
+-    read_dg = get_msg(&f.tr2, &dm);
++    std::unique_ptr<gcomm::evs::Message> dm;
++    read_dg = get_msg(&f.tr2, dm);
+     ck_assert(read_dg != 0);
+-    ck_assert(dm.type() == gcomm::evs::Message::EVS_T_DELAYED_LIST);
+-    read_dg = get_msg(&f.tr2, &gm_discard);
++    ck_assert(dm->type() == gcomm::evs::Message::EVS_T_DELAYED_LIST);
++    read_dg = get_msg(&f.tr2, gm_discard);
+     ck_assert(read_dg == 0);
+     // Move clock forward 100msec, new gap should be now emitted.
+     gu::datetime::SimClock::inc_time(100*gu::datetime::MSec);
+     f.evs2.handle_inactivity_timer();
+-    gcomm::evs::Message gm2;
+-    read_dg = get_msg(&f.tr2, &gm2);
++    std::unique_ptr<gcomm::evs::Message> gm2;
++    read_dg = get_msg(&f.tr2, gm2);
+     ck_assert(read_dg != 0);
+-    ck_assert(gm2.type() == gcomm::evs::Message::EVS_T_GAP);
++    ck_assert(gm2->type() == gcomm::evs::Message::EVS_T_GAP);
+     log_info << "END test_gap_rate_limit_delayed";
+ 
+     gcomm::Datagram* tmp;
+--- a/gcomm/test/check_trace.hpp
++++ b/gcomm/test/check_trace.hpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2009-2014 Codership Oy <info@codership.com>
++ * Copyright (C) 2009-2023 Codership Oy <info@codership.com>
+  *
+  * $Id$
+  */
+@@ -173,7 +173,7 @@ namespace gcomm
+         std::deque<Datagram*> out_;
+         bool queue_;
+         static std::unique_ptr<Protonet> net_;
+-        Protonet& get_net();
++        static Protonet& get_net();
+     public:
+ 
+         DummyTransport(const UUID& uuid = UUID::nil(), bool queue = true,
+--- a/galerautils/tests/CMakeLists.txt
++++ b/galerautils/tests/CMakeLists.txt
+@@ -47,7 +47,6 @@ add_test(
+ #
+ # C++ galerautils tests.
+ #
+-
+ add_executable(gu_tests++
+   gu_atomic_test.cpp
+   gu_gtid_test.cpp
+@@ -75,7 +74,7 @@ add_executable(gu_tests++
+ 
+ target_compile_definitions(gu_tests++
+   PRIVATE
+-  -DGU_ASIO_TEST_CERT_DIR="${PROJECT_SOURCE_DIR}/tests/conf")
++  -DGU_ASIO_TEST_CERT_DIR="${CMAKE_CURRENT_BINARY_DIR}/certs")
+ 
+ # TODO: These should be eventually fixed.
+ target_compile_options(gu_tests++
+@@ -93,7 +92,6 @@ add_test(
+   NAME gu_tests++
+   COMMAND gu_tests++
+   )
+-
+ #
+ # Deqmap micro benchmark.
+ #
+--- a/galerautils/tests/gu_asio_test.cpp
++++ b/galerautils/tests/gu_asio_test.cpp
+@@ -1,5 +1,5 @@
+ /*
+- * Copyright (C) 2019-2020 Codership Oy <info@codership.com>
++ * Copyright (C) 2019-2023 Codership Oy <info@codership.com>
+  */
+ 
+ 
+@@ -920,18 +920,276 @@ END_TEST
+ 
+ #ifdef GALERA_HAVE_SSL
+ 
++#include <openssl/bn.h>
++#include <openssl/conf.h>
++#include <openssl/engine.h>
++#include <openssl/pem.h>
++#include <openssl/x509v3.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <dirent.h>
+ #include <signal.h>
+ 
+-//
+-// SSL
+-//
++#include <vector>
+ 
+ static std::string get_cert_dir()
+ {
+-    // This will be set by CMake/preprocessor.
++    static_assert(::strlen(GU_ASIO_TEST_CERT_DIR) > 0);
++    const std::string ret{ GU_ASIO_TEST_CERT_DIR };
++    auto* dir = opendir(ret.c_str());
++    if (!dir)
++    {
++        if (mkdir(ret.c_str(), S_IRWXU))
++        {
++            const auto* errstr = ::strerror(errno);
++            gu_throw_fatal << "Could not create dir " << ret << ": " << errstr;
++        }
++    }
++    else
++    {
++        closedir(dir);
++    }
+     return GU_ASIO_TEST_CERT_DIR;
+ }
+ 
++static int password_cb(char*, int, int, void*) { return 0; }
++
++static void throw_error(const char* msg)
++{
++    gu_throw_fatal << msg << ": " << ERR_error_string(ERR_get_error(), nullptr);
++}
++
++static EVP_PKEY* create_key()
++{
++#if OPENSSL_VERSION_MAJOR < 3
++    auto* bn = BN_new();
++    if (!bn)
++    {
++        throw_error("could not create BN");
++    }
++    BN_set_word(bn, 0x10001);
++    auto* rsa = RSA_new();
++    if (!rsa)
++    {
++        BN_free(bn);
++        throw_error("could not create RSA");
++    }
++    RSA_generate_key_ex(rsa, 2048, bn, nullptr);
++    auto* pkey = EVP_PKEY_new();
++    if (!pkey)
++    {
++        BN_free(bn);
++        RSA_free(rsa);
++        throw_error("could not create PKEY");
++    }
++    EVP_PKEY_set1_RSA(pkey, rsa);
++    RSA_free(rsa);
++    BN_free(bn);
++    return pkey;
++#else
++    auto* ret = EVP_RSA_gen(2048);
++    if (!ret)
++    {
++        throw_error("could not create RSA");
++    }
++    return ret;
++#endif /* OPENSSL_VERSION_MAJOR < 3 */
++}
++
++static FILE* open_file(const std::string& path, const char* mode)
++{
++    auto* ret = fopen(path.c_str(), mode);
++    if (!ret)
++    {
++        const auto* errstr = ::strerror(errno);
++        gu_throw_fatal << "Could not open file " << path << ": "
++                       << errstr;
++    }
++    return ret;
++}
++
++static void write_key(EVP_PKEY* pkey, const std::string& filename)
++{
++    const std::string cert_dir = get_cert_dir();
++    const std::string key_file_path = cert_dir + "/" + filename;
++    auto* key_file = open_file(key_file_path, "wb");
++    if (!PEM_write_PrivateKey(key_file, pkey, nullptr, nullptr, 0, password_cb,
++                              nullptr))
++    {
++        throw_error("Could not write key");
++    }
++    fclose(key_file);
++}
++
++static void set_x509v3_extensions(X509* x509, X509* issuer)
++{
++    auto* conf_bio = BIO_new(BIO_s_mem());
++    std::string ext{ "[extensions]\n"
++                     "authorityKeyIdentifier=keyid,issuer\n"
++                     "subjectKeyIdentifier=hash\n" };
++    if (!issuer)
++    {
++        ext += "basicConstraints=critical,CA:TRUE\n";
++    }
++    else
++    {
++        ext += "keyUsage=digitalSignature,keyEncipherment\n";
++        ext += "basicConstraints=CA:FALSE\n";
++    }
++    BIO_printf(conf_bio, "%s", ext.c_str());
++    auto* conf = NCONF_new(nullptr);
++    long errorline = -1;
++    int err;
++    if ((err = NCONF_load_bio(conf, conf_bio, &errorline)) <= 0)
++    {
++        gu_throw_fatal << "Could not load conf: " << err;
++    }
++    if (errorline != -1)
++    {
++        gu_throw_fatal << "Could not load conf,  errorline: " << errorline;
++    }
++    // TODO: V3 extensions
++    X509V3_CTX ctx;
++    X509V3_set_ctx(&ctx, issuer ? issuer : x509, x509, nullptr, nullptr, 0);
++    X509V3_set_nconf(&ctx, conf);
++    if (!X509V3_EXT_add_nconf(conf, &ctx, "extensions", x509))
++    {
++        throw_error("Could not add extension");
++    }
++    NCONF_free(conf);
++    BIO_free(conf_bio);
++}
++
++static X509* create_x509(EVP_PKEY* pkey, X509* issuer, const char* cn)
++{
++    auto* x509 = X509_new();
++    /* According to standard, value 2 means version 3. */
++    X509_set_version(x509, 2);
++    ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
++    X509_gmtime_adj(X509_get_notBefore(x509), 0);
++    X509_gmtime_adj(X509_get_notAfter(x509), 31536000L);
++    X509_set_pubkey(x509, pkey);
++
++    auto* name = X509_get_subject_name(x509);
++    X509_NAME_add_entry_by_txt(name, "C", MBSTRING_ASC, (unsigned char*)"FI",
++                               -1, -1, 0);
++    X509_NAME_add_entry_by_txt(name, "ST", MBSTRING_ASC,
++                               (unsigned char*)"Uusimaa", -1, -1, 0);
++    X509_NAME_add_entry_by_txt(name, "L", MBSTRING_ASC,
++                               (unsigned char*)"Helsinki", -1, -1, 0);
++    X509_NAME_add_entry_by_txt(name, "O", MBSTRING_ASC,
++                               (unsigned char*)"Codership", -1, -1, 0);
++    X509_NAME_add_entry_by_txt(name, "OU", MBSTRING_ASC,
++                               (unsigned char*)"Galera Devel", -1, -1, 0);
++    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char*)cn, -1,
++                               -1, 0);
++    if (!issuer)
++    {
++        /* Self signed */
++        X509_set_issuer_name(x509, name);
++    }
++    else
++    {
++        X509_set_issuer_name(x509, X509_get_subject_name(issuer));
++    }
++
++    set_x509v3_extensions(x509, issuer);
++
++    X509_sign(x509, pkey, EVP_sha256());
++
++    return x509;
++}
++
++static void write_x509(X509* x509, const std::string& filename)
++{
++    const std::string cert_dir = get_cert_dir();
++    const std::string file_path = cert_dir + "/" + filename;
++    auto* file = open_file(file_path, "wb");
++    if (!PEM_write_X509(file, x509))
++    {
++        throw_error("Could not write x509");
++    }
++    fclose(file);
++}
++
++static void write_x509_list(const std::vector<X509*>& certs,
++                            const std::string& filename)
++{
++    const std::string cert_dir = get_cert_dir();
++    const std::string file_path = cert_dir + "/" + filename;
++    auto* file = open_file(file_path, "wb");
++    for (auto* x509 : certs)
++    {
++        if (!PEM_write_X509(file, x509))
++        {
++            throw_error("Could not write x509");
++        }
++    }
++    fclose(file);
++}
++
++/* Self signed CA + certificate */
++static void generate_self_signed()
++{
++    auto* pkey = create_key();
++    write_key(pkey, "galera_key.pem");
++    auto* ca = create_x509(pkey, nullptr, "Galera Root");
++    write_x509(ca, "galera_ca.pem");
++
++    auto* cert = create_x509(pkey, ca, "Galera Cert");
++    write_x509(cert, "galera_cert.pem");
++    X509_free(cert);
++    X509_free(ca);
++    EVP_PKEY_free(pkey);
++}
++
++/*
++                             ---- Server cert 1
++                            /
++  Root CA - Intermediate CA
++                            \---- Server cert 2
++
++  Two bundles consisting of intermediate CA and server certificate
++  are created for servers 1 and 2.
++ */
++static void generate_chains()
++{
++    auto* root_ca_key = create_key();
++    auto* root_ca = create_x509(root_ca_key, nullptr, "Galera Root CA");
++    auto* int_ca_key = create_key();
++    auto* int_ca = create_x509(int_ca_key, root_ca, "Galera Intermediate CA");
++
++    auto* server_1_key = create_key();
++    auto* server_1_cert = create_x509(server_1_key, int_ca, "Galera Server 1");
++    auto* server_2_key = create_key();
++    auto* server_2_cert = create_x509(server_2_key, int_ca, "Galera Server 2");
++
++    write_x509(root_ca, "galera-ca.pem");
++    write_key(server_1_key, "galera-server-1.key");
++    write_x509_list({ server_1_cert, int_ca }, "bundle-galera-server-1.pem");
++    write_key(server_2_key, "galera-server-2.key");
++    write_x509_list({ server_2_cert, int_ca }, "bundle-galera-server-2.pem");
++
++    X509_free(server_2_cert);
++    EVP_PKEY_free(server_2_key);
++    X509_free(server_1_cert);
++    EVP_PKEY_free(server_1_key);
++    X509_free(int_ca);
++    EVP_PKEY_free(int_ca_key);
++    X509_free(root_ca);
++    EVP_PKEY_free(root_ca_key);
++}
++
++static void generate_certificates()
++{
++  generate_self_signed();
++  generate_chains();
++}
++
++//
++// SSL
++//
++
+ static gu::Config get_ssl_config()
+ {
+     gu::Config ret;
+@@ -1834,6 +2092,20 @@ END_TEST
+ // Datagram
+ //
+ 
++/* Helper to determine if UDP sockets can be opened. */
++static bool have_datagram() try
++{
++  gu::AsioIoService io_service;
++  gu::URI uri("udp://127.0.0.1:0");
++  auto socket(io_service.make_datagram_socket(uri));
++  socket->open(uri);
++  return true;
++}
++catch (...)
++{
++  return false;
++}
++
+ class MockDatagramSocketHandler : public gu::AsioDatagramSocketHandler
+ {
+ public:
+@@ -2173,6 +2445,7 @@ Suite* gu_asio_suite()
+     //
+     // SSL
+     //
++    generate_certificates();
+ 
+     tc = tcase_create("test_ssl_io_service");
+     tcase_add_test(tc, test_ssl_io_service);
+@@ -2339,6 +2612,7 @@ Suite* gu_asio_suite()
+     //
+     // Datagram
+     //
++    if (have_datagram()) {
+ 
+     tc = tcase_create("test_datagram_socket");
+     tcase_add_test(tc, test_datagram_socket);
+@@ -2360,6 +2634,7 @@ Suite* gu_asio_suite()
+     tcase_add_test(tc, test_datagram_send_to_and_async_read);
+     suite_add_tcase(s, tc);
+ 
++    }
+ #if defined(GALERA_ASIO_TEST_MULTICAST)
+     tc = tcase_create("test_datagram_connect_multicast");
+     tcase_add_test(tc, test_datagram_connect_multicast);
+--- a/galera/src/CMakeLists.txt
++++ b/galera/src/CMakeLists.txt
+@@ -127,7 +127,7 @@ endif()
+ if (GALERA_VERSION_SCRIPT)
+   add_custom_command(TARGET galera_smm POST_BUILD
+     COMMAND
+-    sh -c "! ${CMAKE_OBJDUMP} -T libgalera_smm.so | grep asio 1> /dev/null"
++    sh -c "! ${CMAKE_OBJDUMP} -T libgalera_smm.so | grep asio"
+     WORKING_DIRECTORY "${PROJECT_BINARY_DIR}"
+     COMMENT "Checking library symbol visibility (hidden)"
+     VERBATIM)
+@@ -135,7 +135,7 @@ else()
+   set(GALERA_LINK_OPTIONS "")
+   add_custom_command(TARGET galera_smm POST_BUILD
+     COMMAND
+-    sh -c "${CMAKE_OBJDUMP} -T libgalera_smm.so | grep asio 1> /dev/null"
++    sh -c "${CMAKE_OBJDUMP} -T libgalera_smm.so | grep asio"
+     WORKING_DIRECTORY "${PROJECT_BINARY_DIR}"
+     COMMENT "Checking library symbol visibility (not hidden)"
+     VERBATIM)
+@@ -145,7 +145,7 @@ if (NOT GALERA_WITH_SSL)
+   message(STATUS "Building Galera without SSL")
+   add_custom_command(TARGET galera_smm POST_BUILD
+     COMMAND
+-    sh -c "! (${CMAKE_OBJDUMP} -x libgalera_smm.so | grep NEEDED.*crypto 1> /dev/null) && ! (${CMAKE_OBJDUMP} -x libgalera_smm.so | grep NEEDED.*ssl 1> /dev/null)"
++    sh -c "! (${CMAKE_OBJDUMP} -x libgalera_smm.so | grep NEEDED.*crypto) && ! (${CMAKE_OBJDUMP} -x libgalera_smm.so | grep NEEDED.*ssl)"
+     WORKING_DIRECTORY "${PROJECT_BINARY_DIR}"
+     COMMENT "Verifying that library is not linked with SSL"
+     VERBATIM)
+@@ -154,7 +154,7 @@ else()
+     message(STATUS "Building Galera with static SSL")
+     add_custom_command(TARGET galera_smm POST_BUILD
+       COMMAND
+-      sh -c "(${CMAKE_OBJDUMP} -t libgalera_smm.so | grep OPENSSL 1> /dev/null) && (${CMAKE_OBJDUMP} -t libgalera_smm.so | grep CRYPTO 1> /dev/null)"
++      sh -c "(${CMAKE_OBJDUMP} -t libgalera_smm.so | grep OPENSSL) && (${CMAKE_OBJDUMP} -t libgalera_smm.so | grep CRYPTO)"
+       WORKING_DIRECTORY "${PROJECT_BINARY_DIR}"
+       COMMENT "Verifying that library has OpenSSL linked statically"
+       VERBATIM)
+@@ -162,7 +162,7 @@ else()
+     message(STATUS "Building Galera with SSL")
+     add_custom_command(TARGET galera_smm POST_BUILD
+       COMMAND
+-      sh -c "(${CMAKE_OBJDUMP} -x libgalera_smm.so | grep NEEDED.*crypto 1> /dev/null) && (${CMAKE_OBJDUMP} -x libgalera_smm.so | grep NEEDED.*ssl 1> /dev/null)"
++      sh -c "(${CMAKE_OBJDUMP} -x libgalera_smm.so | grep NEEDED.*crypto) && (${CMAKE_OBJDUMP} -x libgalera_smm.so | grep NEEDED.*ssl)"
+       COMMENT "Verifying that library is linked with SSL"
+       WORKING_DIRECTORY "${PROJECT_BINARY_DIR}"
+       VERBATIM)
